@@ -1,0 +1,1356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Teddy Tennis — Ralph Lauren US Open</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0A2342;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    overflow: hidden;
+    font-family: 'Press Start 2P', monospace;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="480" height="640"></canvas>
+<script>
+// ===== CONSTANTS =====
+const W = 480, H = 640;
+const COLORS = {
+  navy: '#0A2342', red: '#C8102E', cream: '#F5F0E8',
+  grass: '#4A7C59', courtBlue: '#3A6EA5', courtGreen: '#2E5B3A',
+  gold: '#C9A84C', offWhite: '#EDE8DC', white: '#FFFFFF',
+  yellow: '#CCEE44', shadow: 'rgba(0,0,0,0.3)'
+};
+
+// Court geometry
+const COURT_TOP = 220, COURT_BOTTOM = 600;
+const NET_Y = 410;
+const COURT_LEFT = 40, COURT_RIGHT = 440;
+const PLAYER_Y = 555, CPU_Y = 270;
+
+// ===== AUDIO =====
+let audioCtx = null;
+function getAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+function playThwack() {
+  try {
+    const ctx = getAudio();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(220, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(80, ctx.currentTime + 0.08);
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.1);
+    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.1);
+  } catch(e) {}
+}
+function playPoint() {
+  try {
+    const ctx = getAudio();
+    [440, 660].forEach((f, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.type = 'sine'; osc.frequency.value = f;
+      const t = ctx.currentTime + i * 0.18;
+      gain.gain.setValueAtTime(0.25, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+      osc.start(t); osc.stop(t + 0.25);
+    });
+  } catch(e) {}
+}
+function playFanfare() {
+  try {
+    const ctx = getAudio();
+    [523, 659, 784].forEach((f, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.type = 'triangle'; osc.frequency.value = f;
+      const t = ctx.currentTime + i * 0.22;
+      gain.gain.setValueAtTime(0.2, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      osc.start(t); osc.stop(t + 0.3);
+    });
+  } catch(e) {}
+}
+
+// ===== CONFETTI =====
+let confetti = [];
+function spawnConfetti(x, y) {
+  for (let i = 0; i < 60; i++) {
+    confetti.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 8,
+      vy: (Math.random() - 0.8) * 9,
+      color: [COLORS.navy, COLORS.red, COLORS.gold, COLORS.cream, COLORS.white][Math.floor(Math.random()*5)],
+      size: 4 + Math.random() * 4,
+      life: 1, decay: 0.018 + Math.random() * 0.012,
+      rot: Math.random() * Math.PI * 2,
+      rotV: (Math.random() - 0.5) * 0.2
+    });
+  }
+}
+function updateConfetti() {
+  confetti = confetti.filter(p => p.life > 0);
+  confetti.forEach(p => {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.25;
+    p.vx *= 0.97; p.life -= p.decay; p.rot += p.rotV;
+  });
+}
+function drawConfetti(ctx) {
+  confetti.forEach(p => {
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.fillRect(-p.size/2, -p.size/4, p.size, p.size/2);
+    ctx.restore();
+  });
+}
+
+// ===== GAME STATE =====
+const POINT_VALS = ['0','15','30','40'];
+let state = 'splash';
+let splashBallX = 240, splashBallY = 260;
+let splashBallVX = 3.2, splashBallVY = -2.8;
+let splashPulse = 0;
+let splashTime = 0;
+let crowdShimmer = 0;
+let flagFrame = 0, flagTimer = 0;
+let netWave = 0, netWaveTimer = 0;
+
+let sets = [{p:0,c:0},{p:0,c:0},{p:0,c:0}];
+let currentSet = 0;
+let gamesP = 0, gamesC = 0;
+let pointsP = 0, pointsC = 0; // index into POINT_VALS
+let deuce = false, advP = false, advC = false;
+let isTiebreak = false;
+let tbP = 0, tbC = 0;
+
+let setsWonP = 0, setsWonC = 0;
+
+let ball = { x:240, y:350, vx:2, vy:-4, radius:8, trail:[], speed:1 };
+let playerBear = { x:240, y:PLAYER_Y, swing:0, celebrate:0, lose:0, bounce:0, bounceT:0 };
+let cpuBear = { x:240, y:CPU_Y, swing:0, celebrate:0, lose:0, bounce:0, bounceT:0 };
+let playerMoving = 0; // -1 left, 1 right, 0 stop
+let cpuTarget = 240;
+let cpuLag = 0;
+let missTimer = 0;
+let cpuSpeed = 2.8;
+let hitCount = 0;
+let servingPlayer = 'player'; // or 'cpu'
+let inRally = false;
+let pointOverTimer = 0;
+let pointOverMsg = '';
+let matchOverMsg = '';
+let matchWinner = ''; // 'player' or 'cpu'
+let keyLeft = false, keyRight = false, keySwing = false;
+let swingCooldown = 0;
+let touchLeft = false, touchRight = false;
+
+// Keys
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') keyLeft = true;
+  if (e.key === 'ArrowRight') keyRight = true;
+  if (e.key === ' ' || e.key === 'z' || e.key === 'Z') {
+    keySwing = true;
+    if (state === 'splash') startGame();
+    if (state === 'match_over') resetMatch();
+  }
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.preventDefault();
+});
+window.addEventListener('keyup', e => {
+  if (e.key === 'ArrowLeft') keyLeft = false;
+  if (e.key === 'ArrowRight') keyRight = false;
+  if (e.key === ' ' || e.key === 'z' || e.key === 'Z') keySwing = false;
+});
+
+// Touch
+const canvas = document.getElementById('gameCanvas');
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  Array.from(e.changedTouches).forEach(t => {
+    const rect = canvas.getBoundingClientRect();
+    const tx = t.clientX - rect.left;
+    const scaledX = tx * (W / rect.width);
+    if (scaledX < W/2) touchLeft = true; else touchRight = true;
+  });
+  if (state === 'splash') startGame();
+  if (state === 'match_over') resetMatch();
+  // auto swing on touch
+  if (state === 'playing') keySwing = true;
+}, {passive:false});
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  touchLeft = false; touchRight = false; keySwing = false;
+}, {passive:false});
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  touchLeft = false; touchRight = false;
+  Array.from(e.touches).forEach(t => {
+    const rect = canvas.getBoundingClientRect();
+    const tx = t.clientX - rect.left;
+    const scaledX = tx * (W / rect.width);
+    if (scaledX < W/2) touchLeft = true; else touchRight = true;
+  });
+}, {passive:false});
+
+function startGame() {
+  state = 'playing';
+  resetMatch();
+}
+function resetMatch() {
+  sets = [{p:0,c:0},{p:0,c:0},{p:0,c:0}];
+  currentSet = 0; gamesP = 0; gamesC = 0;
+  pointsP = 0; pointsC = 0;
+  deuce = false; advP = false; advC = false;
+  isTiebreak = false; tbP = 0; tbC = 0;
+  setsWonP = 0; setsWonC = 0;
+  hitCount = 0; cpuSpeed = 2.8;
+  confetti = [];
+  servingPlayer = 'player';
+  inRally = false;
+  matchWinner = '';
+  state = 'playing';
+  serveBall();
+}
+
+function serveBall() {
+  inRally = false;
+  swingCooldown = 0;
+  const fromPlayer = servingPlayer === 'player';
+  ball.x = fromPlayer ? playerBear.x : cpuBear.x;
+  ball.y = fromPlayer ? PLAYER_Y - 40 : CPU_Y + 40;
+  ball.vx = fromPlayer ? (Math.random()*3+1.5) * (Math.random()<0.5?1:-1) : (Math.random()*3+1.5) * (Math.random()<0.5?1:-1);
+  ball.vy = fromPlayer ? -(4.5 + Math.random()*1.5) : (4.5 + Math.random()*1.5);
+  ball.speed = 1 + (currentSet * 0.08);
+  ball.trail = [];
+  hitCount = 0;
+  inRally = true;
+}
+
+// ===== SCORING =====
+function scorePoint(winner) {
+  playPoint();
+  spawnConfetti(ball.x, ball.y);
+  if (isTiebreak) {
+    if (winner === 'player') tbP++; else tbC++;
+    const lead = Math.abs(tbP - tbC);
+    const hi = Math.max(tbP, tbC);
+    if (hi >= 7 && lead >= 2) {
+      const gWinner = winner;
+      tbP = 0; tbC = 0; isTiebreak = false;
+      scoreGame(gWinner);
+    } else {
+      pointOverMsg = winner === 'player' ? 'POLO BEAR!' : 'RALPH BEAR!';
+      state = 'point_over'; pointOverTimer = 90;
+      servingPlayer = winner;
+      serveBall();
+    }
+    return;
+  }
+  if (!deuce && !advP && !advC) {
+    if (winner === 'player') pointsP++; else pointsC++;
+    if (pointsP >= 3 && pointsC >= 3) {
+      deuce = true; pointsP = 3; pointsC = 3;
+    }
+    if (!deuce) {
+      if (pointsP >= 4) { scoreGame('player'); return; }
+      if (pointsC >= 4) { scoreGame('cpu'); return; }
+    }
+  } else if (deuce) {
+    if (winner === 'player') advP = true; else advC = true;
+    deuce = false;
+  } else if (advP) {
+    if (winner === 'player') { scoreGame('player'); return; }
+    else { advP = false; deuce = true; }
+  } else if (advC) {
+    if (winner === 'cpu') { scoreGame('cpu'); return; }
+    else { advC = false; deuce = true; }
+  }
+  pointOverMsg = winner === 'player' ? 'POLO BEAR!' : 'RALPH BEAR!';
+  state = 'point_over'; pointOverTimer = 90;
+  servingPlayer = winner;
+  serveBall();
+}
+
+function scoreGame(winner) {
+  playFanfare();
+  deuce = false; advP = false; advC = false;
+  pointsP = 0; pointsC = 0;
+  if (winner === 'player') gamesP++; else gamesC++;
+  sets[currentSet] = {p:gamesP, c:gamesC};
+  // Check tiebreak
+  if (gamesP === 6 && gamesC === 6) {
+    isTiebreak = true;
+    pointOverMsg = 'TIEBREAK!';
+    state = 'point_over'; pointOverTimer = 110;
+    servingPlayer = winner;
+    serveBall();
+    return;
+  }
+  // Check set win
+  const pWin = (gamesP >= 6 && gamesP - gamesC >= 2);
+  const cWin = (gamesC >= 6 && gamesC - gamesP >= 2);
+  if (pWin || cWin) {
+    const sw = pWin ? 'player' : 'cpu';
+    sets[currentSet] = {p:gamesP, c:gamesC};
+    if (sw === 'player') setsWonP++; else setsWonC++;
+    gamesP = 0; gamesC = 0;
+    currentSet = Math.min(currentSet + 1, 2);
+    cpuSpeed += 0.35;
+    if (setsWonP >= 2 || setsWonC >= 2) {
+      matchWinner = sw;
+      pointOverMsg = sw === 'player' ? 'CHAMPION!' : 'GAME SET MATCH';
+      state = 'match_over';
+      if (sw === 'player') { playerBear.celebrate = 120; spawnConfetti(240, 400); }
+      else cpuBear.celebrate = 120;
+      return;
+    }
+    pointOverMsg = 'GAME — ' + (sw==='player'?'POLO BEAR!':'RALPH BEAR!');
+    state = 'point_over'; pointOverTimer = 130;
+    servingPlayer = winner;
+    serveBall();
+    return;
+  }
+  pointOverMsg = 'GAME — ' + (winner==='player'?'POLO BEAR!':'RALPH BEAR!');
+  state = 'point_over'; pointOverTimer = 110;
+  servingPlayer = winner;
+  serveBall();
+}
+
+function getScoreDisplay() {
+  if (isTiebreak) return [tbP, tbC];
+  if (deuce) return ['40','40'];
+  if (advP) return ['AD','—'];
+  if (advC) return ['—','AD'];
+  return [POINT_VALS[pointsP]||'0', POINT_VALS[pointsC]||'0'];
+}
+
+// ===== DRAWING: COURT =====
+function drawCourt(ctx) {
+  // Sky gradient
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, COURT_TOP);
+  skyGrad.addColorStop(0, '#0A1830');
+  skyGrad.addColorStop(0.6, '#1A3A6A');
+  skyGrad.addColorStop(1, '#1E4080');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, W, COURT_TOP);
+
+  // Stars
+  const starSeeds = [13,37,71,101,199,257,311,401,503,601,701,809,907,1009];
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  starSeeds.forEach(s => {
+    const sx = (s * 37 + 7) % (W - 20) + 10;
+    const sy = (s * 13 + 3) % (COURT_TOP - 20) + 5;
+    ctx.fillRect(sx, sy, 2, 2);
+  });
+
+  // Stadium lights (4 posts)
+  [[80,15],[200,10],[280,10],[400,15]].forEach(([lx,ly]) => {
+    ctx.fillStyle = '#8899BB';
+    ctx.fillRect(lx-3, ly, 6, 50);
+    ctx.fillStyle = '#EEEEBB';
+    ctx.fillRect(lx-10, ly-4, 20, 8);
+    ctx.fillStyle = 'rgba(255,255,200,0.18)';
+    ctx.beginPath();
+    ctx.ellipse(lx, ly, 30, 60, 0, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // Stadium stands
+  const standGrad = ctx.createLinearGradient(0, COURT_TOP, 0, COURT_TOP+90);
+  standGrad.addColorStop(0, '#162040');
+  standGrad.addColorStop(1, '#0F1A35');
+  ctx.fillStyle = standGrad;
+  ctx.fillRect(0, COURT_TOP, W, 90);
+
+  // Crowd silhouettes with shimmer
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 24; col++) {
+      const cx2 = 10 + col * 20 + (row%2)*10;
+      const cy2 = COURT_TOP + 12 + row*22;
+      const shimmerVal = Math.sin(crowdShimmer * 0.7 + col * 0.5 + row * 1.2);
+      const baseC = row % 2 === 0 ? [20,40,80] : [180,10,30];
+      const r = Math.floor(baseC[0] + shimmerVal * 15);
+      const g2 = Math.floor(baseC[1] + shimmerVal * 8);
+      const b2 = Math.floor(baseC[2] + shimmerVal * 20);
+      ctx.fillStyle = `rgb(${r},${g2},${b2})`;
+      ctx.beginPath();
+      ctx.arc(cx2, cy2, 6, Math.PI, 0);
+      ctx.fillRect(cx2-6, cy2, 12, 10);
+    }
+  }
+
+  // Court surround
+  ctx.fillStyle = COLORS.courtGreen;
+  ctx.fillRect(0, COURT_TOP+90, W, COURT_BOTTOM-(COURT_TOP+90));
+
+  // Court surface
+  ctx.fillStyle = COLORS.courtBlue;
+  ctx.fillRect(COURT_LEFT, COURT_TOP+90, COURT_RIGHT-COURT_LEFT, COURT_BOTTOM-(COURT_TOP+90));
+
+  // Court lines
+  ctx.strokeStyle = COLORS.white;
+  ctx.lineWidth = 2;
+  // Baseline top
+  ctx.beginPath(); ctx.moveTo(COURT_LEFT, COURT_TOP+100); ctx.lineTo(COURT_RIGHT, COURT_TOP+100); ctx.stroke();
+  // Baseline bottom
+  ctx.beginPath(); ctx.moveTo(COURT_LEFT, COURT_BOTTOM-10); ctx.lineTo(COURT_RIGHT, COURT_BOTTOM-10); ctx.stroke();
+  // Sidelines
+  ctx.beginPath(); ctx.moveTo(COURT_LEFT, COURT_TOP+100); ctx.lineTo(COURT_LEFT, COURT_BOTTOM-10); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(COURT_RIGHT, COURT_TOP+100); ctx.lineTo(COURT_RIGHT, COURT_BOTTOM-10); ctx.stroke();
+  // Center service line
+  ctx.beginPath(); ctx.moveTo(240, COURT_TOP+100); ctx.lineTo(240, COURT_BOTTOM-10); ctx.stroke();
+  // Service boxes
+  const svcLineY1 = NET_Y - 90, svcLineY2 = NET_Y + 90;
+  ctx.beginPath(); ctx.moveTo(COURT_LEFT, svcLineY1); ctx.lineTo(COURT_RIGHT, svcLineY1); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(COURT_LEFT, svcLineY2); ctx.lineTo(COURT_RIGHT, svcLineY2); ctx.stroke();
+  // Singles sidelines inset
+  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(COURT_LEFT+15, COURT_TOP+100); ctx.lineTo(COURT_LEFT+15, COURT_BOTTOM-10); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(COURT_RIGHT-15, COURT_TOP+100); ctx.lineTo(COURT_RIGHT-15, COURT_BOTTOM-10); ctx.stroke();
+
+  // Banners on surround
+  const bannerTexts = ['POLO RALPH LAUREN','US OPEN','POLO RALPH LAUREN','US OPEN'];
+  const bannerColors = [COLORS.navy, COLORS.red, COLORS.navy, COLORS.red];
+  bannerTexts.forEach((txt, i) => {
+    const bx = 0 + i * 120;
+    ctx.fillStyle = bannerColors[i];
+    ctx.fillRect(bx, COURT_TOP+90, 119, 22);
+    ctx.fillStyle = COLORS.gold;
+    ctx.font = '5px "Press Start 2P"';
+    ctx.textAlign = 'center';
+    ctx.fillText(txt, bx+59, COURT_TOP+105);
+  });
+
+  // RL flag animation
+  const flagX = COURT_RIGHT + 5, flagY = COURT_TOP + 50;
+  ctx.fillStyle = '#8899BB';
+  ctx.fillRect(flagX, COURT_TOP+90, 3, -60);
+  const fw = 30, fh = 18;
+  const waveOffsets = [[0,0,0,0],[0,2,-2,0],[0,-2,2,0]];
+  const wo = waveOffsets[flagFrame % 3];
+  ctx.fillStyle = COLORS.navy;
+  ctx.beginPath();
+  ctx.moveTo(flagX+3, flagY);
+  ctx.lineTo(flagX+3+fw/2+wo[1], flagY+fh/2*0.5+wo[0]);
+  ctx.lineTo(flagX+3+fw+wo[2], flagY+fh/2+wo[1]);
+  ctx.lineTo(flagX+3+fw/2+wo[3], flagY+fh*0.8+wo[2]);
+  ctx.lineTo(flagX+3, flagY+fh+wo[3]);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '5px "Press Start 2P"';
+  ctx.textAlign = 'left';
+  ctx.fillText('RL', flagX+6, flagY+11);
+
+  // Net
+  ctx.fillStyle = '#334466';
+  ctx.fillRect(COURT_LEFT-5, NET_Y-4, COURT_RIGHT-COURT_LEFT+10, 8);
+  // Net mesh
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+  ctx.lineWidth = 1;
+  const netW = COURT_RIGHT - COURT_LEFT;
+  const netT = netWave;
+  for (let nx = 0; nx <= netW; nx += 12) {
+    const woff = Math.sin(nx * 0.08 + netT) * 1.5;
+    ctx.beginPath();
+    ctx.moveTo(COURT_LEFT+nx, NET_Y-4+woff);
+    ctx.lineTo(COURT_LEFT+nx, NET_Y+4+woff);
+    ctx.stroke();
+  }
+  for (let ny = -4; ny <= 4; ny += 4) {
+    ctx.beginPath();
+    for (let nx2 = 0; nx2 <= netW; nx2 += 4) {
+      const woff2 = Math.sin(nx2 * 0.08 + netT) * 1.5;
+      if (nx2 === 0) ctx.moveTo(COURT_LEFT+nx2, NET_Y+ny+woff2);
+      else ctx.lineTo(COURT_LEFT+nx2, NET_Y+ny+woff2);
+    }
+    ctx.stroke();
+  }
+  // Net posts
+  ctx.fillStyle = COLORS.white;
+  ctx.fillRect(COURT_LEFT-8, NET_Y-18, 8, 26);
+  ctx.fillRect(COURT_RIGHT, NET_Y-18, 8, 26);
+  // Net top white band
+  ctx.fillStyle = COLORS.white;
+  ctx.fillRect(COURT_LEFT-5, NET_Y-6, netW+10, 3);
+  // RL polo player on net post (mini)
+  drawMiniRLLogo(ctx, COURT_LEFT-4, NET_Y-12);
+}
+
+function drawMiniRLLogo(ctx, x, y) {
+  ctx.fillStyle = COLORS.navy;
+  ctx.fillRect(x, y, 6, 8);
+  ctx.fillStyle = COLORS.gold;
+  // tiny horse silhouette
+  ctx.fillRect(x+1, y+1, 4, 3);
+  ctx.fillRect(x+3, y+3, 2, 4);
+}
+
+// ===== DRAWING: BEARS =====
+function drawBear(ctx, bx, by, isPlayer, swing, celebrate, lose, bounceOff) {
+  ctx.save();
+  ctx.translate(bx, by + bounceOff);
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(0, 30, 22, 7, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Determine arm angle based on state
+  let armAngle = 0.3; // default
+  if (swing > 0) armAngle = -1.1;
+  if (celebrate > 0) armAngle = -1.4;
+  if (lose > 0) armAngle = 0.9;
+
+  // Body
+  ctx.fillStyle = '#C8A060'; // teddy brown
+  ctx.beginPath();
+  ctx.ellipse(0, 10, 18, 22, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Shirt
+  if (isPlayer) {
+    // Navy rugby shirt with red+white stripes
+    ctx.fillStyle = COLORS.navy;
+    ctx.beginPath();
+    ctx.ellipse(0, 10, 16, 20, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Stripes
+    const stripeColors = [COLORS.red, COLORS.white, COLORS.red];
+    stripeColors.forEach((sc, si) => {
+      ctx.fillStyle = sc;
+      ctx.fillRect(-15, -2 + si*7, 30, 4);
+    });
+    // Clip shirt to body shape
+  } else {
+    // White tennis whites with navy trim
+    ctx.fillStyle = '#F0EDE0';
+    ctx.beginPath();
+    ctx.ellipse(0, 10, 16, 20, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = COLORS.navy;
+    ctx.fillRect(-16, 8, 32, 3);
+  }
+
+  // Shorts
+  if (isPlayer) {
+    ctx.fillStyle = COLORS.white;
+  } else {
+    ctx.fillStyle = COLORS.white;
+  }
+  ctx.fillRect(-14, 20, 28, 14);
+
+  // Left leg
+  ctx.fillStyle = '#C8A060';
+  ctx.fillRect(-12, 30, 10, 14);
+  // Right leg
+  ctx.fillRect(2, 30, 10, 14);
+
+  // Shoes
+  ctx.fillStyle = COLORS.white;
+  ctx.beginPath();
+  ctx.ellipse(-7, 44, 8, 5, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(7, 44, 8, 5, 0, 0, Math.PI*2);
+  ctx.fill();
+  if (isPlayer) {
+    ctx.fillStyle = COLORS.red;
+    ctx.fillRect(-14, 41, 14, 3);
+    ctx.fillRect(0, 41, 14, 3);
+  }
+
+  // Left arm
+  ctx.fillStyle = '#C8A060';
+  ctx.save();
+  ctx.translate(-18, 0);
+  ctx.rotate(-armAngle * 0.5);
+  ctx.fillRect(-5, 0, 10, 18);
+  ctx.beginPath();
+  ctx.arc(0, 18, 6, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+
+  // Right arm + racket
+  ctx.save();
+  ctx.translate(18, 0);
+  ctx.rotate(armAngle);
+  ctx.fillStyle = '#C8A060';
+  ctx.fillRect(-5, 0, 10, 18);
+  ctx.beginPath();
+  ctx.arc(0, 18, 6, 0, Math.PI*2);
+  ctx.fill();
+  // Racket
+  ctx.fillStyle = '#8B4513';
+  ctx.fillRect(-2, 14, 4, 22); // handle
+  ctx.strokeStyle = isPlayer ? COLORS.navy : COLORS.navy;
+  ctx.lineWidth = 2;
+  ctx.fillStyle = 'rgba(200,200,200,0.6)';
+  ctx.beginPath();
+  ctx.ellipse(0, 8, 11, 14, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // Racket strings
+  ctx.strokeStyle = 'rgba(220,220,180,0.8)';
+  ctx.lineWidth = 0.5;
+  for (let si = -8; si <= 8; si += 4) {
+    ctx.beginPath(); ctx.moveTo(si, -5); ctx.lineTo(si, 21); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-10, si+8); ctx.lineTo(10, si+8); ctx.stroke();
+  }
+  ctx.restore();
+
+  // Head (on top of body)
+  ctx.fillStyle = '#C8A060';
+  ctx.beginPath();
+  ctx.arc(0, -16, 18, 0, Math.PI*2);
+  ctx.fill();
+
+  // Ears
+  ctx.fillStyle = '#C8A060';
+  ctx.beginPath(); ctx.arc(-14, -30, 8, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(14, -30, 8, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#E8B880';
+  ctx.beginPath(); ctx.arc(-14, -30, 5, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(14, -30, 5, 0, Math.PI*2); ctx.fill();
+
+  // Cap/visor
+  if (isPlayer) {
+    ctx.fillStyle = COLORS.navy;
+    ctx.beginPath();
+    ctx.ellipse(0, -26, 16, 6, 0, 0, Math.PI);
+    ctx.fill();
+    ctx.fillRect(-16, -32, 32, 8);
+    ctx.fillStyle = COLORS.white;
+    ctx.fillRect(-18, -28, 36, 4);
+  } else {
+    ctx.fillStyle = COLORS.white;
+    ctx.beginPath();
+    ctx.ellipse(0, -26, 16, 6, 0, 0, Math.PI);
+    ctx.fill();
+    ctx.fillRect(-16, -32, 32, 8);
+    ctx.fillStyle = COLORS.navy;
+    ctx.fillRect(-18, -28, 36, 4);
+  }
+
+  // Face
+  ctx.fillStyle = '#E8B880';
+  ctx.beginPath();
+  ctx.ellipse(0, -12, 10, 8, 0, 0, Math.PI*2);
+  ctx.fill();
+  // Eyes
+  if (celebrate > 0) {
+    // Happy arc eyes
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(-6, -18, 3, Math.PI, 0); ctx.stroke();
+    ctx.beginPath(); ctx.arc(6, -18, 3, Math.PI, 0); ctx.stroke();
+  } else if (lose > 0) {
+    // Sad eyes
+    ctx.fillStyle = '#333';
+    ctx.fillRect(-8, -19, 4, 3);
+    ctx.fillRect(4, -19, 4, 3);
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(-5, -14, 3, 0, Math.PI); ctx.stroke();
+  } else {
+    // Normal eyes
+    ctx.fillStyle = '#222';
+    ctx.beginPath(); ctx.arc(-6, -18, 3, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(6, -18, 3, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'white';
+    ctx.beginPath(); ctx.arc(-5, -19, 1, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(7, -19, 1, 0, Math.PI*2); ctx.fill();
+  }
+  // Nose
+  ctx.fillStyle = '#7B3F00';
+  ctx.beginPath(); ctx.ellipse(0, -13, 4, 3, 0, 0, Math.PI*2); ctx.fill();
+  // Mouth
+  ctx.strokeStyle = '#5B2F00'; ctx.lineWidth = 1.5;
+  if (celebrate > 0) {
+    ctx.beginPath(); ctx.arc(0, -10, 4, 0.1, Math.PI-0.1); ctx.stroke();
+  } else if (lose > 0) {
+    ctx.beginPath(); ctx.arc(0, -7, 4, Math.PI+0.1, -0.1); ctx.stroke();
+  } else {
+    ctx.beginPath(); ctx.arc(0, -10, 3, 0.2, Math.PI-0.2); ctx.stroke();
+  }
+
+  // RL logo on shirt
+  ctx.fillStyle = isPlayer ? COLORS.gold : COLORS.gold;
+  ctx.font = '5px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('RL', 0, -2);
+
+  ctx.restore();
+}
+
+// ===== DRAWING: SPLASH BEAR =====
+function drawSplashBear(ctx) {
+  const bx = 240, by = 200;
+  ctx.save();
+  ctx.translate(bx, by);
+  const sc = 1.4;
+  ctx.scale(sc, sc);
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(0, 35, 28, 9, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Body
+  ctx.fillStyle = '#C8A060';
+  ctx.beginPath();
+  ctx.ellipse(0, 12, 22, 28, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Navy polo shirt
+  ctx.fillStyle = COLORS.navy;
+  ctx.beginPath();
+  ctx.ellipse(0, 12, 20, 26, 0, 0, Math.PI*2);
+  ctx.fill();
+  // Stripes
+  [COLORS.red, COLORS.white, COLORS.red].forEach((sc2, i) => {
+    ctx.fillStyle = sc2;
+    ctx.fillRect(-19, -5 + i*9, 38, 5);
+  });
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '6px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('RL', 0, 2);
+
+  // Shorts
+  ctx.fillStyle = COLORS.white;
+  ctx.fillRect(-18, 26, 36, 18);
+
+  // Legs
+  ctx.fillStyle = '#C8A060';
+  ctx.fillRect(-14, 38, 12, 18);
+  ctx.fillRect(2, 38, 12, 18);
+
+  // Shoes
+  ctx.fillStyle = COLORS.white;
+  ctx.beginPath(); ctx.ellipse(-8, 56, 10, 6, 0, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(8, 56, 10, 6, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = COLORS.red;
+  ctx.fillRect(-17, 52, 18, 4);
+  ctx.fillRect(-1, 52, 18, 4);
+
+  // Arms
+  ctx.fillStyle = '#C8A060';
+  // Left arm raised in celebration
+  ctx.save(); ctx.translate(-22, 0); ctx.rotate(-1.0);
+  ctx.fillRect(-5, 0, 10, 20);
+  ctx.beginPath(); ctx.arc(0, 20, 7, 0, Math.PI*2); ctx.fill(); ctx.restore();
+  // Right arm with racket
+  ctx.save(); ctx.translate(22, 0); ctx.rotate(-0.8);
+  ctx.fillRect(-5, 0, 10, 20);
+  ctx.beginPath(); ctx.arc(0, 20, 7, 0, Math.PI*2); ctx.fill();
+  // Racket
+  ctx.fillStyle = '#8B4513';
+  ctx.fillRect(-3, 16, 6, 28);
+  ctx.fillStyle = 'rgba(200,200,200,0.7)';
+  ctx.beginPath(); ctx.ellipse(0, 8, 14, 18, 0, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.strokeStyle = 'rgba(220,220,180,0.8)'; ctx.lineWidth = 0.7;
+  for (let si = -10; si <= 10; si += 5) {
+    ctx.beginPath(); ctx.moveTo(si, -8); ctx.lineTo(si, 24); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-12, si+8); ctx.lineTo(12, si+8); ctx.stroke();
+  }
+  ctx.restore();
+
+  // Head
+  ctx.fillStyle = '#C8A060';
+  ctx.beginPath(); ctx.arc(0, -20, 22, 0, Math.PI*2); ctx.fill();
+  // Ears
+  ctx.beginPath(); ctx.arc(-17, -36, 10, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(17, -36, 10, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#E8B880';
+  ctx.beginPath(); ctx.arc(-17, -36, 6, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(17, -36, 6, 0, Math.PI*2); ctx.fill();
+  // Cap
+  ctx.fillStyle = COLORS.navy;
+  ctx.fillRect(-20, -40, 40, 10);
+  ctx.beginPath(); ctx.ellipse(0, -30, 20, 7, 0, 0, Math.PI); ctx.fill();
+  ctx.fillStyle = COLORS.white;
+  ctx.fillRect(-22, -35, 44, 5);
+  // Face
+  ctx.fillStyle = '#E8B880';
+  ctx.beginPath(); ctx.ellipse(0, -16, 13, 10, 0, 0, Math.PI*2); ctx.fill();
+  // Happy eyes
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(-7, -22, 4, Math.PI, 0); ctx.stroke();
+  ctx.beginPath(); ctx.arc(7, -22, 4, Math.PI, 0); ctx.stroke();
+  // Nose
+  ctx.fillStyle = '#7B3F00';
+  ctx.beginPath(); ctx.ellipse(0, -16, 5, 4, 0, 0, Math.PI*2); ctx.fill();
+  // Smile
+  ctx.strokeStyle = '#5B2F00'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, -12, 5, 0.1, Math.PI-0.1); ctx.stroke();
+
+  ctx.restore();
+}
+
+// ===== DRAWING: BALL =====
+function drawBall(ctx, bx, by, radius, trail) {
+  // Trail
+  trail.forEach((tp, i) => {
+    const alpha = (i / trail.length) * 0.4;
+    ctx.fillStyle = `rgba(180,220,60,${alpha})`;
+    ctx.beginPath();
+    ctx.arc(tp.x, tp.y, radius * (i/trail.length) * 0.8, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // Shadow on court (only if ball is on court)
+  if (by > COURT_TOP+90 && by < COURT_BOTTOM) {
+    const shadowY = Math.min(by + 20, COURT_BOTTOM - 15);
+    const heightAboveCourt = Math.max(0, shadowY - by);
+    const shadowScale = Math.max(0.2, 1 - heightAboveCourt * 0.02);
+    ctx.fillStyle = `rgba(0,0,0,${0.25 * shadowScale})`;
+    ctx.beginPath();
+    ctx.ellipse(bx, shadowY, radius * shadowScale * 1.5, radius * shadowScale * 0.5, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // Ball
+  ctx.fillStyle = '#CCEE44';
+  ctx.beginPath();
+  ctx.arc(bx, by, radius, 0, Math.PI*2);
+  ctx.fill();
+
+  // Seam
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(bx, by, radius * 0.7, 0.5, Math.PI - 0.5);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(bx, by, radius * 0.7, Math.PI + 0.5, -0.5);
+  ctx.stroke();
+}
+
+// ===== DRAWING: HUD =====
+function drawHUD(ctx) {
+  // HUD background panel
+  ctx.fillStyle = 'rgba(10,35,66,0.92)';
+  ctx.fillRect(0, 0, W, 48);
+  ctx.fillStyle = COLORS.gold;
+  ctx.fillRect(0, 46, W, 2);
+
+  // Title
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '8px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('TEDDY TENNIS', W/2, 14);
+
+  // Score display
+  const scoreDisp = getScoreDisplay();
+  ctx.fillStyle = COLORS.cream;
+  ctx.font = '7px "Press Start 2P"';
+  ctx.textAlign = 'left';
+  ctx.fillText('POLO', 10, 32);
+  ctx.fillText('RALPH', W - 60, 32);
+  ctx.fillStyle = COLORS.white;
+  ctx.font = '9px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText(String(scoreDisp[0]), 120, 38);
+  ctx.fillText(String(scoreDisp[1]), W-120, 38);
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '7px "Press Start 2P"';
+  ctx.fillText('VS', W/2, 38);
+
+  // Set scores
+  const setStr = sets.slice(0, Math.max(currentSet+1, 1)).map(s => `${s.p}-${s.c}`).join('  ');
+  ctx.fillStyle = '#88AACC';
+  ctx.font = '6px "Press Start 2P"';
+  ctx.fillText('SETS: ' + setStr, W/2, 26);
+}
+
+// ===== DRAWING: SPLASH =====
+function drawSplash(ctx) {
+  // Background
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#060F20');
+  grad.addColorStop(0.5, COLORS.navy);
+  grad.addColorStop(1, '#0F1E3A');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  [50,130,220,310,420,70,190,350,15,290,440,165,375,85,255].forEach((sx, i) => {
+    const sy = [30,55,20,80,40,110,65,25,90,50,75,35,95,15,60][i];
+    const pulse = Math.sin(splashTime * 0.05 + i * 0.7) * 0.5 + 0.5;
+    ctx.globalAlpha = 0.4 + pulse * 0.6;
+    ctx.fillRect(sx, sy, 2, 2);
+  });
+  ctx.globalAlpha = 1;
+
+  // Court preview strip at bottom
+  ctx.fillStyle = COLORS.courtBlue;
+  ctx.fillRect(0, H-120, W, 120);
+  ctx.fillStyle = COLORS.courtGreen;
+  ctx.fillRect(0, H-130, W, 14);
+  ctx.fillStyle = COLORS.white;
+  ctx.fillRect(40, H-120, 2, 120);
+  ctx.fillRect(W-42, H-120, 2, 120);
+  ctx.fillRect(40, H-75, W-80, 2);
+
+  // Draw splash bear
+  drawSplashBear(ctx);
+
+  // Title "TEDDY TENNIS"
+  ctx.shadowColor = COLORS.gold;
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '22px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('TEDDY', W/2, 340);
+  ctx.fillText('TENNIS', W/2, 368);
+  ctx.shadowBlur = 0;
+
+  // Subtitle
+  ctx.fillStyle = COLORS.cream;
+  ctx.font = '6px "Press Start 2P"';
+  ctx.fillText('A RALPH LAUREN', W/2, 390);
+  ctx.fillText('US OPEN EXPERIENCE', W/2, 404);
+
+  // Bouncing ball off title area
+  ctx.fillStyle = '#CCEE44';
+  ctx.beginPath();
+  ctx.arc(splashBallX, splashBallY, 8, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(splashBallX, splashBallY, 5, 0.5, Math.PI-0.5);
+  ctx.stroke();
+
+  // Pulsing PRESS TO PLAY button
+  const pulse = Math.sin(splashTime * 0.08) * 0.15 + 0.85;
+  ctx.save();
+  ctx.translate(W/2, 470);
+  ctx.scale(pulse, pulse);
+  ctx.fillStyle = COLORS.red;
+  ctx.beginPath();
+  ctx.roundRect(-100, -18, 200, 36, 6);
+  ctx.fill();
+  ctx.fillStyle = COLORS.white;
+  ctx.font = '9px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('PRESS TO PLAY', 0, 6);
+  ctx.restore();
+
+  // RL Logo corner (bottom-left)
+  ctx.fillStyle = COLORS.navy;
+  ctx.fillRect(10, H-50, 50, 35);
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '7px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('RL', 35, H-28);
+  // Polo player mini logo
+  ctx.fillStyle = COLORS.white;
+  ctx.fillRect(20, H-46, 30, 14);
+  ctx.fillStyle = COLORS.navy;
+  ctx.font = '5px "Press Start 2P"';
+  ctx.fillText('POLO', 35, H-37);
+
+  // Ralph's Coffee cup (bottom-right corner)
+  drawRalphsCoffee(ctx, W-60, H-55);
+}
+
+function drawRalphsCoffee(ctx, x, y) {
+  // Cup body
+  ctx.fillStyle = '#8B2020';
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x+6, y+30);
+  ctx.lineTo(x+34, y+30);
+  ctx.lineTo(x+40, y);
+  ctx.closePath();
+  ctx.fill();
+  // Cup top rim
+  ctx.fillStyle = COLORS.white;
+  ctx.fillRect(x-2, y-4, 44, 7);
+  // Coffee text
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '5px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText("RALPH'S", x+20, y+12);
+  ctx.fillText('COFFEE', x+20, y+22);
+  // Handle
+  ctx.strokeStyle = '#8B2020';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(x+38, y+15, 8, -0.5, 0.5);
+  ctx.stroke();
+  // Steam
+  ctx.strokeStyle = 'rgba(200,200,200,0.5)';
+  ctx.lineWidth = 1.5;
+  [0, 8, 16].forEach(ox => {
+    const steamOff = Math.sin(splashTime * 0.05 + ox * 0.3) * 2;
+    ctx.beginPath();
+    ctx.moveTo(x+8+ox, y-6);
+    ctx.quadraticCurveTo(x+12+ox+steamOff, y-14, x+8+ox, y-20);
+    ctx.stroke();
+  });
+}
+
+// ===== DRAWING: POINT OVERLAY =====
+function drawPointOverlay(ctx, msg) {
+  ctx.fillStyle = 'rgba(10,35,66,0.82)';
+  ctx.fillRect(60, 270, 360, 100);
+  ctx.fillStyle = COLORS.gold;
+  ctx.fillRect(60, 268, 360, 4);
+  ctx.fillRect(60, 368, 360, 4);
+  ctx.fillStyle = COLORS.white;
+  ctx.font = '14px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  // Multi-line if long
+  if (msg.length > 12) {
+    const parts = msg.split('—');
+    if (parts.length > 1) {
+      ctx.fillText(parts[0].trim(), W/2, 305);
+      ctx.fillStyle = COLORS.gold;
+      ctx.font = '11px "Press Start 2P"';
+      ctx.fillText(parts[1].trim(), W/2, 335);
+    } else {
+      ctx.font = '10px "Press Start 2P"';
+      ctx.fillText(msg, W/2, 320);
+    }
+  } else {
+    ctx.fillText(msg, W/2, 325);
+  }
+}
+
+// ===== DRAWING: MATCH OVER =====
+function drawMatchOver(ctx) {
+  ctx.fillStyle = 'rgba(10,35,66,0.95)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  [50,130,220,310,420,70,190,350,15,440].forEach((sx, i) => {
+    ctx.fillRect(sx, 20+i*15, 2, 2);
+  });
+
+  if (matchWinner === 'player') {
+    ctx.shadowColor = COLORS.gold;
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = COLORS.gold;
+    ctx.font = '28px "Press Start 2P"';
+    ctx.textAlign = 'center';
+    ctx.fillText('CHAMPION!', W/2, 100);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = COLORS.cream;
+    ctx.font = '9px "Press Start 2P"';
+    ctx.fillText('POLO BEAR WINS!', W/2, 128);
+    drawBear(ctx, 240, 280, true, 0, 120, 0, Math.sin(Date.now()*0.004)*4);
+  } else {
+    ctx.fillStyle = COLORS.red;
+    ctx.font = '14px "Press Start 2P"';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME, SET,', W/2, 90);
+    ctx.fillText('MATCH', W/2, 112);
+    ctx.fillStyle = COLORS.cream;
+    ctx.font = '11px "Press Start 2P"';
+    ctx.fillText('RALPH BEAR', W/2, 138);
+    drawBear(ctx, 240, 280, false, 0, 0, 120, 0);
+  }
+
+  // Set summary
+  ctx.fillStyle = COLORS.white;
+  ctx.font = '8px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  const setDisplay = sets.slice(0, Math.max(currentSet, setsWonP+setsWonC)).map(s=>`${s.p}-${s.c}`).join('  ');
+  ctx.fillText('SETS: ' + setDisplay, W/2, 390);
+
+  // Play Again button
+  const pulse = Math.sin(Date.now() * 0.004) * 0.1 + 0.9;
+  ctx.save();
+  ctx.translate(W/2, 450);
+  ctx.scale(pulse, pulse);
+  ctx.fillStyle = COLORS.red;
+  ctx.beginPath();
+  ctx.roundRect(-100, -20, 200, 40, 6);
+  ctx.fill();
+  ctx.fillStyle = COLORS.white;
+  ctx.font = '10px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('PLAY AGAIN', 0, 7);
+  ctx.restore();
+
+  // Tagline
+  ctx.fillStyle = COLORS.gold;
+  ctx.font = '6px "Press Start 2P"';
+  ctx.textAlign = 'center';
+  ctx.fillText('See you at the US Open', W/2, 510);
+  ctx.fillText('— Ralph Lauren', W/2, 524);
+
+  // Confetti
+  drawConfetti(ctx);
+}
+
+// ===== GAME UPDATE =====
+function updateGame() {
+  if (state !== 'playing') return;
+
+  // Player movement
+  const moveDir = (keyLeft || touchLeft) ? -1 : (keyRight || touchRight) ? 1 : 0;
+  playerBear.x += moveDir * 4;
+  playerBear.x = Math.max(COURT_LEFT + 20, Math.min(COURT_RIGHT - 20, playerBear.x));
+
+  // CPU AI
+  const targetX = ball.x + cpuLag;
+  const dx = targetX - cpuBear.x;
+  // 12% miss rate: occasionally overshoot/undershoot
+  if (Math.random() < 0.002) cpuLag = (Math.random() - 0.5) * 60;
+  const move = Math.min(Math.abs(dx), cpuSpeed) * Math.sign(dx);
+  cpuBear.x += move;
+  cpuBear.x = Math.max(COURT_LEFT + 20, Math.min(COURT_RIGHT - 20, cpuBear.x));
+
+  // Bear bounce animation
+  playerBear.bounceT += 0.065;
+  playerBear.bounce = Math.sin(playerBear.bounceT) * 2;
+  cpuBear.bounceT += 0.065;
+  cpuBear.bounce = Math.sin(cpuBear.bounceT) * 2;
+
+  // Swing cooldown
+  if (swingCooldown > 0) swingCooldown--;
+  if (playerBear.swing > 0) playerBear.swing--;
+  if (cpuBear.swing > 0) cpuBear.swing--;
+  if (playerBear.celebrate > 0) playerBear.celebrate--;
+  if (cpuBear.celebrate > 0) cpuBear.celebrate--;
+  if (playerBear.lose > 0) playerBear.lose--;
+  if (cpuBear.lose > 0) cpuBear.lose--;
+
+  if (!inRally) return;
+
+  // Ball movement with slight parabolic arc gravity
+  ball.trail.push({x: ball.x, y: ball.y});
+  if (ball.trail.length > 4) ball.trail.shift();
+
+  const spd = ball.speed;
+  ball.x += ball.vx * spd;
+  ball.y += ball.vy * spd;
+  // Slight gravity-like arc
+  ball.vy += 0.04;
+
+  // Spin effect after 5 hits
+  if (hitCount >= 5) {
+    ball.vx += (Math.random() - 0.5) * 0.04;
+  }
+
+  // Wall bounces
+  if (ball.x - ball.radius < COURT_LEFT) {
+    ball.x = COURT_LEFT + ball.radius;
+    ball.vx = Math.abs(ball.vx);
+  }
+  if (ball.x + ball.radius > COURT_RIGHT) {
+    ball.x = COURT_RIGHT - ball.radius;
+    ball.vx = -Math.abs(ball.vx);
+  }
+
+  // Net collision check (ball must clear net height)
+  const netHeight = 14;
+  const netTop = NET_Y - netHeight;
+  if (Math.abs(ball.y - NET_Y) < netHeight && ball.x > COURT_LEFT && ball.x < COURT_RIGHT) {
+    // Ball is near net height
+    if (ball.y > netTop && ball.y < NET_Y + 4) {
+      // Hit the net
+      ball.vy = -Math.abs(ball.vy) * 0.6;
+      ball.y = netTop - ball.radius;
+      netWave = Date.now() * 0.02;
+      // If ball falls back, it's a fault for whoever last hit it
+    }
+  }
+
+  // Player swing detection
+  if ((keySwing || touchRight || touchLeft) && swingCooldown === 0) {
+    const pdx = ball.x - playerBear.x;
+    const pdy = ball.y - (PLAYER_Y - 10);
+    const dist = Math.sqrt(pdx*pdx + pdy*pdy);
+    if (dist < 45 && ball.vy > 0) {
+      hitBall('player');
+    }
+  }
+
+  // CPU auto-hit
+  const cdx = ball.x - cpuBear.x;
+  const cdy = ball.y - (CPU_Y + 10);
+  const cdist = Math.sqrt(cdx*cdx + cdy*cdy);
+  if (cdist < 45 && ball.vy < 0 && cpuBear.swing === 0) {
+    // 12% miss chance
+    if (Math.random() < 0.12) {
+      // CPU misses — ball continues through
+    } else {
+      hitBall('cpu');
+    }
+  }
+
+  // Score: ball past player (bottom)
+  if (ball.y > COURT_BOTTOM + 10) {
+    cpuBear.celebrate = 60;
+    playerBear.lose = 60;
+    inRally = false;
+    scorePoint('cpu');
+    return;
+  }
+
+  // Score: ball past CPU (top)
+  if (ball.y < COURT_TOP + 80) {
+    playerBear.celebrate = 60;
+    cpuBear.lose = 60;
+    inRally = false;
+    scorePoint('player');
+    return;
+  }
+}
+
+function hitBall(hitter) {
+  playThwack();
+  hitCount++;
+  // Speed increase per hit
+  ball.speed = 1 + (currentSet * 0.08) + Math.min(hitCount * 0.04, 0.8);
+
+  if (hitter === 'player') {
+    swingCooldown = 18;
+    playerBear.swing = 18;
+    const angle = (ball.x - playerBear.x) * 0.035;
+    ball.vx = angle + (Math.random() - 0.5) * 0.5;
+    ball.vy = -(5 + Math.random() * 2);
+    ball.y = PLAYER_Y - 50;
+  } else {
+    cpuBear.swing = 18;
+    const angle = (ball.x - cpuBear.x) * 0.035;
+    ball.vx = angle + (Math.random() - 0.5) * 0.5;
+    ball.vy = (5 + Math.random() * 2);
+    ball.y = CPU_Y + 50;
+  }
+
+  // Clamp vx
+  ball.vx = Math.max(-5, Math.min(5, ball.vx));
+  netWave = Date.now() * 0.02;
+}
+
+// ===== MAIN GAME LOOP =====
+let lastTime = 0;
+function gameLoop(timestamp) {
+  const dt = timestamp - lastTime;
+  lastTime = timestamp;
+
+  // Update timers
+  splashTime++;
+  crowdShimmer += 0.025;
+  flagTimer++;
+  if (flagTimer > 12) { flagTimer = 0; flagFrame = (flagFrame+1) % 3; }
+  netWaveTimer += 0.05;
+  netWave = netWaveTimer;
+
+  // Update splash ball
+  if (state === 'splash') {
+    splashBallX += splashBallVX;
+    splashBallY += splashBallVY;
+    splashBallVY += 0.08;
+    if (splashBallX < 20 || splashBallX > W-20) splashBallVX *= -1;
+    if (splashBallY > 420) { splashBallVY = -Math.abs(splashBallVY) * 0.9; splashBallY = 420; }
+    if (splashBallY < 130) { splashBallVY = Math.abs(splashBallVY); }
+    splashBallX = Math.max(20, Math.min(W-20, splashBallX));
+  }
+
+  // Point over timer
+  if (state === 'point_over') {
+    pointOverTimer--;
+    if (pointOverTimer <= 0) state = 'playing';
+    updateConfetti();
+  }
+
+  // Game update
+  if (state === 'playing') {
+    updateGame();
+    updateConfetti();
+  }
+
+  if (state === 'match_over') {
+    updateConfetti();
+    if (matchWinner === 'player') {
+      playerBear.celebrate = 120;
+      spawnConfetti(Math.random() * W, Math.random() * 200 + 100);
+    }
+  }
+
+  // Draw
+  const canvas2 = document.getElementById('gameCanvas');
+  const ctx = canvas2.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  if (state === 'splash') {
+    drawSplash(ctx);
+  } else if (state === 'playing' || state === 'point_over') {
+    // Draw court
+    drawCourt(ctx);
+
+    // Draw bears
+    const pbounce = playerBear.bounce;
+    const cbounce = cpuBear.bounce;
+    // CPU bear (upside down perspective — flip vertically)
+    ctx.save();
+    ctx.translate(cpuBear.x, cpuBear.y);
+    ctx.scale(1, -1); // flip for CPU (facing down)
+    ctx.translate(-cpuBear.x, -cpuBear.y);
+    drawBear(ctx, cpuBear.x, cpuBear.y, false, cpuBear.swing, cpuBear.celebrate, cpuBear.lose, cbounce);
+    ctx.restore();
+
+    // Player bear
+    drawBear(ctx, playerBear.x, playerBear.y, true, playerBear.swing, playerBear.celebrate, playerBear.lose, pbounce);
+
+    // Ball
+    drawBall(ctx, ball.x, ball.y, ball.radius, ball.trail);
+
+    // Confetti
+    drawConfetti(ctx);
+
+    // HUD
+    drawHUD(ctx);
+
+    // Point over overlay
+    if (state === 'point_over') {
+      drawPointOverlay(ctx, pointOverMsg);
+    }
+  } else if (state === 'match_over') {
+    drawCourt(ctx);
+    drawMatchOver(ctx);
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// Start
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
