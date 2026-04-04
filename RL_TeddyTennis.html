@@ -34,11 +34,35 @@ const COLORS = {
   yellow: '#CCEE44', shadow: 'rgba(0,0,0,0.3)'
 };
 
-// Court geometry
-const COURT_TOP = 220, COURT_BOTTOM = 600;
-const NET_Y = 410;
-const COURT_LEFT = 40, COURT_RIGHT = 440;
-const PLAYER_Y = 555, CPU_Y = 270;
+// Perspective court geometry
+const NEAR_SY = 580; // player baseline screen Y
+const FAR_SY  = 242; // CPU baseline screen Y
+const NEAR_LX = 30;  // court left at near
+const NEAR_RX = 450; // court right at near
+const FAR_LX  = 152; // court left at far
+const FAR_RX  = 328; // court right at far
+const PLAYER_CY = 0.04; // player position in court Y [0=near,1=far]
+const CPU_CY    = 0.96; // CPU position in court Y
+const NET_CY    = 0.5;  // net midpoint
+const NET_HEIGHT_Z = 15; // net height (z-units)
+const GRAVITY   = 0.45;
+const Z_VIS     = 2.2;  // screen pixels per z-unit (visual scale)
+// Legacy aliases for splash/HUD
+const COURT_TOP = FAR_SY - 30, COURT_BOTTOM = NEAR_SY + 20;
+const COURT_LEFT = NEAR_LX, COURT_RIGHT = NEAR_RX;
+const PLAYER_Y = NEAR_SY, CPU_Y = FAR_SY;
+const NET_Y = Math.round(NEAR_SY + (FAR_SY - NEAR_SY) * NET_CY);
+
+function courtToScreen(cx, cy, z) {
+  z = z || 0;
+  const sy = NEAR_SY + (FAR_SY - NEAR_SY) * cy;
+  const lx = NEAR_LX + (FAR_LX - NEAR_LX) * cy;
+  const rx = NEAR_RX + (FAR_RX - NEAR_RX) * cy;
+  const sx = lx + cx * (rx - lx);
+  const perspScale = 1 - cy * 0.45;
+  const zOffset = -z * perspScale * Z_VIS;
+  return { x: sx, y: sy + zOffset, scale: perspScale };
+}
 
 // ===== AUDIO =====
 let audioCtx = null;
@@ -147,14 +171,12 @@ let tbP = 0, tbC = 0;
 
 let setsWonP = 0, setsWonC = 0;
 
-let ball = { x:240, y:350, vx:2, vy:-4, radius:8, trail:[], speed:1 };
-let playerBear = { x:240, y:PLAYER_Y, swing:0, celebrate:0, lose:0, bounce:0, bounceT:0 };
-let cpuBear = { x:240, y:CPU_Y, swing:0, celebrate:0, lose:0, bounce:0, bounceT:0 };
-let playerMoving = 0; // -1 left, 1 right, 0 stop
-let cpuTarget = 240;
+// ball uses court coords: cx/cy [0-1], z=height above court, vcy>0=toward CPU
+let ball = { cx:0.5, cy:0.5, z:0, vcx:0, vcy:0, vz:0, radius:8, trail:[], speed:1 };
+let playerBear = { cx:0.5, swing:0, celebrate:0, lose:0, bounce:0, bounceT:0 };
+let cpuBear    = { cx:0.5, swing:0, celebrate:0, lose:0, bounce:0, bounceT:0 };
 let cpuLag = 0;
-let missTimer = 0;
-let cpuSpeed = 2.8;
+let cpuSpeed = 0.012; // court units per frame
 let hitCount = 0;
 let servingPlayer = 'player'; // or 'cpu'
 let inRally = false;
@@ -224,7 +246,7 @@ function resetMatch() {
   deuce = false; advP = false; advC = false;
   isTiebreak = false; tbP = 0; tbC = 0;
   setsWonP = 0; setsWonC = 0;
-  hitCount = 0; cpuSpeed = 2.8;
+  hitCount = 0; cpuSpeed = 0.012;
   confetti = [];
   servingPlayer = 'player';
   inRally = false;
@@ -237,10 +259,13 @@ function serveBall() {
   inRally = false;
   swingCooldown = 0;
   const fromPlayer = servingPlayer === 'player';
-  ball.x = fromPlayer ? playerBear.x : cpuBear.x;
-  ball.y = fromPlayer ? PLAYER_Y - 40 : CPU_Y + 40;
-  ball.vx = fromPlayer ? (Math.random()*3+1.5) * (Math.random()<0.5?1:-1) : (Math.random()*3+1.5) * (Math.random()<0.5?1:-1);
-  ball.vy = fromPlayer ? -(4.5 + Math.random()*1.5) : (4.5 + Math.random()*1.5);
+  ball.cx = fromPlayer ? playerBear.cx : cpuBear.cx;
+  ball.cy = fromPlayer ? PLAYER_CY + 0.05 : CPU_CY - 0.05;
+  ball.vcx = (Math.random() - 0.5) * 0.014;
+  // vcy>0 = toward CPU; player serves toward CPU, cpu serves toward player
+  ball.vcy = fromPlayer ? 0.030 : -0.030;
+  ball.z = 2;
+  ball.vz = 5;
   ball.speed = 1 + (currentSet * 0.08);
   ball.trail = [];
   hitCount = 0;
@@ -250,7 +275,8 @@ function serveBall() {
 // ===== SCORING =====
 function scorePoint(winner) {
   playPoint();
-  spawnConfetti(ball.x, ball.y);
+  const bsp = courtToScreen(ball.cx, ball.cy, ball.z);
+  spawnConfetti(bsp.x, bsp.y);
   if (isTiebreak) {
     if (winner === 'player') tbP++; else tbC++;
     const lead = Math.abs(tbP - tbC);
@@ -316,7 +342,7 @@ function scoreGame(winner) {
     if (sw === 'player') setsWonP++; else setsWonC++;
     gamesP = 0; gamesC = 0;
     currentSet = Math.min(currentSet + 1, 2);
-    cpuSpeed += 0.35;
+    cpuSpeed += 0.002;
     if (setsWonP >= 2 || setsWonC >= 2) {
       matchWinner = sw;
       pointOverMsg = sw === 'player' ? 'CHAMPION!' : 'GAME SET MATCH';
@@ -345,158 +371,169 @@ function getScoreDisplay() {
   return [POINT_VALS[pointsP]||'0', POINT_VALS[pointsC]||'0'];
 }
 
-// ===== DRAWING: COURT =====
+// ===== DRAWING: COURT (perspective) =====
+function cLine(ctx, cx1, cy1, cx2, cy2) {
+  const a = courtToScreen(cx1, cy1, 0), b = courtToScreen(cx2, cy2, 0);
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+}
+function courtLineH(ctx, cy) { cLine(ctx, 0, cy, 1, cy); }
+
 function drawCourt(ctx) {
-  // Sky gradient
-  const skyGrad = ctx.createLinearGradient(0, 0, 0, COURT_TOP);
-  skyGrad.addColorStop(0, '#0A1830');
-  skyGrad.addColorStop(0.6, '#1A3A6A');
-  skyGrad.addColorStop(1, '#1E4080');
-  ctx.fillStyle = skyGrad;
-  ctx.fillRect(0, 0, W, COURT_TOP);
+  // ---- Sky ----
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, FAR_SY);
+  skyGrad.addColorStop(0, '#070F1E'); skyGrad.addColorStop(0.7, '#122040'); skyGrad.addColorStop(1, '#1A3060');
+  ctx.fillStyle = skyGrad; ctx.fillRect(0, 0, W, FAR_SY);
 
   // Stars
-  const starSeeds = [13,37,71,101,199,257,311,401,503,601,701,809,907,1009];
+  const starSeeds = [13,37,71,101,199,257,311,401,503,601];
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
   starSeeds.forEach(s => {
-    const sx = (s * 37 + 7) % (W - 20) + 10;
-    const sy = (s * 13 + 3) % (COURT_TOP - 20) + 5;
-    ctx.fillRect(sx, sy, 2, 2);
+    ctx.fillRect((s*37+7)%(W-30)+15, (s*13+3)%(FAR_SY-50)+8, 2, 2);
   });
 
-  // Stadium lights (4 posts)
-  [[80,15],[200,10],[280,10],[400,15]].forEach(([lx,ly]) => {
-    ctx.fillStyle = '#8899BB';
-    ctx.fillRect(lx-3, ly, 6, 50);
-    ctx.fillStyle = '#EEEEBB';
-    ctx.fillRect(lx-10, ly-4, 20, 8);
-    ctx.fillStyle = 'rgba(255,255,200,0.18)';
-    ctx.beginPath();
-    ctx.ellipse(lx, ly, 30, 60, 0, 0, Math.PI*2);
-    ctx.fill();
+  // Stadium lights (4 posts above court)
+  [[70,12],[190,8],[290,8],[410,12]].forEach(([lx,ly]) => {
+    ctx.fillStyle = '#6677AA'; ctx.fillRect(lx-3, ly, 5, 48);
+    ctx.fillStyle = '#DDDDAA'; ctx.fillRect(lx-9, ly-4, 18, 6);
+    ctx.fillStyle = 'rgba(255,255,180,0.12)';
+    ctx.beginPath(); ctx.ellipse(lx, ly+10, 24, 50, 0, 0, Math.PI*2); ctx.fill();
   });
 
-  // Stadium stands
-  const standGrad = ctx.createLinearGradient(0, COURT_TOP, 0, COURT_TOP+90);
-  standGrad.addColorStop(0, '#162040');
-  standGrad.addColorStop(1, '#0F1A35');
-  ctx.fillStyle = standGrad;
-  ctx.fillRect(0, COURT_TOP, W, 90);
+  // Crowd stand band (behind far baseline)
+  const standGrad = ctx.createLinearGradient(0, 52, 0, FAR_SY);
+  standGrad.addColorStop(0, '#101828'); standGrad.addColorStop(1, '#0E1830');
+  ctx.fillStyle = standGrad; ctx.fillRect(0, 52, W, FAR_SY - 52);
 
-  // Crowd silhouettes with shimmer
-  for (let row = 0; row < 3; row++) {
-    for (let col = 0; col < 24; col++) {
-      const cx2 = 10 + col * 20 + (row%2)*10;
-      const cy2 = COURT_TOP + 12 + row*22;
-      const shimmerVal = Math.sin(crowdShimmer * 0.7 + col * 0.5 + row * 1.2);
-      const baseC = row % 2 === 0 ? [20,40,80] : [180,10,30];
-      const r = Math.floor(baseC[0] + shimmerVal * 15);
-      const g2 = Math.floor(baseC[1] + shimmerVal * 8);
-      const b2 = Math.floor(baseC[2] + shimmerVal * 20);
-      ctx.fillStyle = `rgb(${r},${g2},${b2})`;
-      ctx.beginPath();
-      ctx.arc(cx2, cy2, 6, Math.PI, 0);
-      ctx.fillRect(cx2-6, cy2, 12, 10);
+  // Crowd rows — 4 rows shrinking toward top
+  for (let row = 3; row >= 0; row--) {
+    const rowY = FAR_SY - 18 - row * 20;
+    const rowW = 28 + row * 56;  // wider rows near court
+    const rowStart = (W - rowW * 2) / 2;
+    const heads = Math.floor(rowW / 9);
+    for (let col = 0; col < heads * 2; col++) {
+      const hx = rowStart + col * 9 + (row % 2) * 4;
+      const hy = rowY;
+      const shimmerVal = Math.sin(crowdShimmer * 0.7 + col * 0.5 + row * 1.3);
+      const baseC = (col + row) % 3 === 0 ? [20,40,90] : (col+row) % 3 === 1 ? [170,12,28] : [18,30,60];
+      const rv = Math.floor(baseC[0] + shimmerVal*14);
+      const gv = Math.floor(baseC[1] + shimmerVal*8);
+      const bv = Math.floor(baseC[2] + shimmerVal*18);
+      ctx.fillStyle = `rgb(${rv},${gv},${bv})`;
+      ctx.beginPath(); ctx.arc(hx, hy, 5, Math.PI, 0); ctx.fill();
+      ctx.fillRect(hx-5, hy, 10, 8);
     }
   }
 
-  // Court surround
-  ctx.fillStyle = COLORS.courtGreen;
-  ctx.fillRect(0, COURT_TOP+90, W, COURT_BOTTOM-(COURT_TOP+90));
+  // Back-wall scoreboard sign (behind far baseline, SNES-style)
+  ctx.fillStyle = '#1A1A2E';
+  ctx.fillRect(W/2-80, FAR_SY - 60, 160, 52);
+  ctx.fillStyle = COLORS.gold; ctx.lineWidth = 2; ctx.strokeStyle = COLORS.gold;
+  ctx.strokeRect(W/2-80, FAR_SY - 60, 160, 52);
+  ctx.font = '5px "Press Start 2P"'; ctx.textAlign = 'center';
+  ctx.fillText('POLO BEAR', W/2, FAR_SY - 47);
+  ctx.fillStyle = COLORS.white; ctx.font = '8px "Press Start 2P"';
+  const scoreDisp2 = getScoreDisplay();
+  ctx.fillText(scoreDisp2[0] + '   ' + scoreDisp2[1], W/2, FAR_SY - 33);
+  ctx.fillStyle = COLORS.cream; ctx.font = '5px "Press Start 2P"';
+  ctx.fillText('RALPH BEAR', W/2, FAR_SY - 20);
 
-  // Court surface
-  ctx.fillStyle = COLORS.courtBlue;
-  ctx.fillRect(COURT_LEFT, COURT_TOP+90, COURT_RIGHT-COURT_LEFT, COURT_BOTTOM-(COURT_TOP+90));
-
-  // Court lines
-  ctx.strokeStyle = COLORS.white;
-  ctx.lineWidth = 2;
-  // Baseline top
-  ctx.beginPath(); ctx.moveTo(COURT_LEFT, COURT_TOP+100); ctx.lineTo(COURT_RIGHT, COURT_TOP+100); ctx.stroke();
-  // Baseline bottom
-  ctx.beginPath(); ctx.moveTo(COURT_LEFT, COURT_BOTTOM-10); ctx.lineTo(COURT_RIGHT, COURT_BOTTOM-10); ctx.stroke();
-  // Sidelines
-  ctx.beginPath(); ctx.moveTo(COURT_LEFT, COURT_TOP+100); ctx.lineTo(COURT_LEFT, COURT_BOTTOM-10); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(COURT_RIGHT, COURT_TOP+100); ctx.lineTo(COURT_RIGHT, COURT_BOTTOM-10); ctx.stroke();
-  // Center service line
-  ctx.beginPath(); ctx.moveTo(240, COURT_TOP+100); ctx.lineTo(240, COURT_BOTTOM-10); ctx.stroke();
-  // Service boxes
-  const svcLineY1 = NET_Y - 90, svcLineY2 = NET_Y + 90;
-  ctx.beginPath(); ctx.moveTo(COURT_LEFT, svcLineY1); ctx.lineTo(COURT_RIGHT, svcLineY1); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(COURT_LEFT, svcLineY2); ctx.lineTo(COURT_RIGHT, svcLineY2); ctx.stroke();
-  // Singles sidelines inset
-  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
-  ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(COURT_LEFT+15, COURT_TOP+100); ctx.lineTo(COURT_LEFT+15, COURT_BOTTOM-10); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(COURT_RIGHT-15, COURT_TOP+100); ctx.lineTo(COURT_RIGHT-15, COURT_BOTTOM-10); ctx.stroke();
-
-  // Banners on surround
-  const bannerTexts = ['POLO RALPH LAUREN','US OPEN','POLO RALPH LAUREN','US OPEN'];
-  const bannerColors = [COLORS.navy, COLORS.red, COLORS.navy, COLORS.red];
-  bannerTexts.forEach((txt, i) => {
-    const bx = 0 + i * 120;
-    ctx.fillStyle = bannerColors[i];
-    ctx.fillRect(bx, COURT_TOP+90, 119, 22);
-    ctx.fillStyle = COLORS.gold;
-    ctx.font = '5px "Press Start 2P"';
-    ctx.textAlign = 'center';
-    ctx.fillText(txt, bx+59, COURT_TOP+105);
-  });
-
-  // RL flag animation
-  const flagX = COURT_RIGHT + 5, flagY = COURT_TOP + 50;
-  ctx.fillStyle = '#8899BB';
-  ctx.fillRect(flagX, COURT_TOP+90, 3, -60);
-  const fw = 30, fh = 18;
+  // RL flag (left side, on pole)
+  const flagX = 18, flagPoleTop = FAR_SY - 55, flagPoleBot = FAR_SY + 10;
+  ctx.fillStyle = '#667799'; ctx.fillRect(flagX, flagPoleTop, 3, flagPoleBot - flagPoleTop);
+  const fw = 28, fh = 16;
   const waveOffsets = [[0,0,0,0],[0,2,-2,0],[0,-2,2,0]];
   const wo = waveOffsets[flagFrame % 3];
   ctx.fillStyle = COLORS.navy;
   ctx.beginPath();
-  ctx.moveTo(flagX+3, flagY);
-  ctx.lineTo(flagX+3+fw/2+wo[1], flagY+fh/2*0.5+wo[0]);
-  ctx.lineTo(flagX+3+fw+wo[2], flagY+fh/2+wo[1]);
-  ctx.lineTo(flagX+3+fw/2+wo[3], flagY+fh*0.8+wo[2]);
-  ctx.lineTo(flagX+3, flagY+fh+wo[3]);
+  ctx.moveTo(flagX+3, flagPoleTop);
+  ctx.lineTo(flagX+3+fw/2+wo[1], flagPoleTop+fh*0.4+wo[0]);
+  ctx.lineTo(flagX+3+fw+wo[2], flagPoleTop+fh/2+wo[1]);
+  ctx.lineTo(flagX+3+fw/2+wo[3], flagPoleTop+fh*0.8+wo[2]);
+  ctx.lineTo(flagX+3, flagPoleTop+fh+wo[3]);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = COLORS.gold; ctx.font = '5px "Press Start 2P"'; ctx.textAlign = 'left';
+  ctx.fillText('RL', flagX+6, flagPoleTop+10);
+
+  // ---- Green surround (fills area between sky and near baseline) ----
+  ctx.fillStyle = COLORS.courtGreen;
+  ctx.fillRect(0, FAR_SY, W, NEAR_SY - FAR_SY + 30);
+
+  // Court surface trapezoid
+  ctx.fillStyle = COLORS.courtBlue;
+  ctx.beginPath();
+  ctx.moveTo(NEAR_LX, NEAR_SY);
+  ctx.lineTo(NEAR_RX, NEAR_SY);
+  ctx.lineTo(FAR_RX, FAR_SY);
+  ctx.lineTo(FAR_LX, FAR_SY);
   ctx.closePath();
   ctx.fill();
-  ctx.fillStyle = COLORS.gold;
-  ctx.font = '5px "Press Start 2P"';
-  ctx.textAlign = 'left';
-  ctx.fillText('RL', flagX+6, flagY+11);
 
-  // Net
-  ctx.fillStyle = '#334466';
-  ctx.fillRect(COURT_LEFT-5, NET_Y-4, COURT_RIGHT-COURT_LEFT+10, 8);
-  // Net mesh
-  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
-  ctx.lineWidth = 1;
-  const netW = COURT_RIGHT - COURT_LEFT;
-  const netT = netWave;
-  for (let nx = 0; nx <= netW; nx += 12) {
-    const woff = Math.sin(nx * 0.08 + netT) * 1.5;
+  // Courtside banners on green surround (left & right triangles)
+  const bannerData = [['POLO RALPH LAUREN', COLORS.navy],['US OPEN', COLORS.red],['POLO RALPH LAUREN', COLORS.navy],['US OPEN', COLORS.red]];
+  bannerData.forEach(([txt, col], i) => {
+    const bx = (i < 2) ? 0 : W / 2;
+    const bw = W / 4;
+    const by = FAR_SY + 4 + (i % 2) * 22;
+    ctx.fillStyle = col; ctx.fillRect(bx + (i%2)*bw, by, bw-2, 18);
+    ctx.fillStyle = COLORS.gold; ctx.font = '4px "Press Start 2P"'; ctx.textAlign = 'center';
+    ctx.fillText(txt, bx + (i%2)*bw + bw/2 - 1, by + 11);
+  });
+
+  // ---- Court lines ----
+  ctx.strokeStyle = COLORS.white; ctx.lineWidth = 2;
+  courtLineH(ctx, 0);   // near baseline
+  courtLineH(ctx, 1);   // far baseline
+  cLine(ctx, 0, 0, 0, 1); // left sideline
+  cLine(ctx, 1, 0, 1, 1); // right sideline
+  cLine(ctx, 0.5, 0, 0.5, 1); // center service line
+  courtLineH(ctx, 0.27); // player's service line
+  courtLineH(ctx, 0.73); // CPU's service line
+
+  // Doubles sidelines (slightly transparent)
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1;
+  cLine(ctx, 0.08, 0, 0.08, 1);
+  cLine(ctx, 0.92, 0, 0.92, 1);
+
+  // ---- Net (3D perspective) ----
+  const netL0 = courtToScreen(-0.02, NET_CY, 0);
+  const netR0 = courtToScreen(1.02, NET_CY, 0);
+  const netL1 = courtToScreen(-0.02, NET_CY, NET_HEIGHT_Z);
+  const netR1 = courtToScreen(1.02, NET_CY, NET_HEIGHT_Z);
+
+  // Net body
+  ctx.fillStyle = 'rgba(20,30,50,0.88)';
+  ctx.beginPath();
+  ctx.moveTo(netL1.x, netL1.y); ctx.lineTo(netR1.x, netR1.y);
+  ctx.lineTo(netR0.x, netR0.y); ctx.lineTo(netL0.x, netL0.y);
+  ctx.closePath(); ctx.fill();
+
+  // Net mesh lines (vertical)
+  ctx.strokeStyle = 'rgba(200,210,230,0.55)'; ctx.lineWidth = 1;
+  const netWAmt = netWave;
+  for (let ni = 0; ni <= 1; ni += 0.06) {
+    const nb = courtToScreen(ni, NET_CY, 0);
+    const nt = courtToScreen(ni, NET_CY, NET_HEIGHT_Z);
+    const woff = Math.sin(ni * 18 + netWAmt) * 0.8;
+    ctx.beginPath(); ctx.moveTo(nb.x + woff, nb.y); ctx.lineTo(nt.x + woff, nt.y); ctx.stroke();
+  }
+  // Net mesh lines (horizontal, 3 rows)
+  for (let nz = 0; nz <= NET_HEIGHT_Z; nz += NET_HEIGHT_Z / 3) {
     ctx.beginPath();
-    ctx.moveTo(COURT_LEFT+nx, NET_Y-4+woff);
-    ctx.lineTo(COURT_LEFT+nx, NET_Y+4+woff);
+    const nl = courtToScreen(-0.02, NET_CY, nz);
+    const nr = courtToScreen(1.02, NET_CY, nz);
+    ctx.moveTo(nl.x, nl.y + Math.sin(netWAmt)*0.6);
+    ctx.lineTo(nr.x, nr.y + Math.sin(netWAmt + 0.5)*0.6);
     ctx.stroke();
   }
-  for (let ny = -4; ny <= 4; ny += 4) {
-    ctx.beginPath();
-    for (let nx2 = 0; nx2 <= netW; nx2 += 4) {
-      const woff2 = Math.sin(nx2 * 0.08 + netT) * 1.5;
-      if (nx2 === 0) ctx.moveTo(COURT_LEFT+nx2, NET_Y+ny+woff2);
-      else ctx.lineTo(COURT_LEFT+nx2, NET_Y+ny+woff2);
-    }
-    ctx.stroke();
-  }
+  // Net top tape (white stripe)
+  ctx.strokeStyle = COLORS.white; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(netL1.x, netL1.y); ctx.lineTo(netR1.x, netR1.y); ctx.stroke();
+
   // Net posts
   ctx.fillStyle = COLORS.white;
-  ctx.fillRect(COURT_LEFT-8, NET_Y-18, 8, 26);
-  ctx.fillRect(COURT_RIGHT, NET_Y-18, 8, 26);
-  // Net top white band
-  ctx.fillStyle = COLORS.white;
-  ctx.fillRect(COURT_LEFT-5, NET_Y-6, netW+10, 3);
-  // RL polo player on net post (mini)
-  drawMiniRLLogo(ctx, COURT_LEFT-4, NET_Y-12);
+  ctx.fillRect(netL0.x - 5, netL1.y - 4, 5, netL0.y - netL1.y + 8);
+  ctx.fillRect(netR0.x,     netR1.y - 4, 5, netR0.y - netR1.y + 8);
+  drawMiniRLLogo(ctx, netL0.x - 4, netL1.y);
 }
 
 function drawMiniRLLogo(ctx, x, y) {
@@ -815,42 +852,35 @@ function drawSplashBear(ctx) {
 }
 
 // ===== DRAWING: BALL =====
-function drawBall(ctx, bx, by, radius, trail) {
+function drawBall(ctx, b) {
+  const pos = courtToScreen(b.cx, b.cy, b.z);
+  const groundPos = courtToScreen(b.cx, b.cy, 0);
+
   // Trail
-  trail.forEach((tp, i) => {
-    const alpha = (i / trail.length) * 0.4;
+  b.trail.forEach((tp, i) => {
+    const tpos = courtToScreen(tp.cx, tp.cy, tp.z || 0);
+    const alpha = (i / b.trail.length) * 0.38;
+    const tr = b.radius * tpos.scale * (i / b.trail.length) * 0.75;
     ctx.fillStyle = `rgba(180,220,60,${alpha})`;
-    ctx.beginPath();
-    ctx.arc(tp.x, tp.y, radius * (i/trail.length) * 0.8, 0, Math.PI*2);
-    ctx.fill();
+    ctx.beginPath(); ctx.arc(tpos.x, tpos.y, Math.max(tr, 1), 0, Math.PI*2); ctx.fill();
   });
 
-  // Shadow on court (only if ball is on court)
-  if (by > COURT_TOP+90 && by < COURT_BOTTOM) {
-    const shadowY = Math.min(by + 20, COURT_BOTTOM - 15);
-    const heightAboveCourt = Math.max(0, shadowY - by);
-    const shadowScale = Math.max(0.2, 1 - heightAboveCourt * 0.02);
-    ctx.fillStyle = `rgba(0,0,0,${0.25 * shadowScale})`;
+  // Shadow on court surface (at z=0)
+  if (b.z > 0.5) {
+    const alpha = Math.max(0.05, 0.28 - b.z * 0.007);
+    ctx.fillStyle = `rgba(0,0,0,${alpha})`;
     ctx.beginPath();
-    ctx.ellipse(bx, shadowY, radius * shadowScale * 1.5, radius * shadowScale * 0.5, 0, 0, Math.PI*2);
+    ctx.ellipse(groundPos.x, groundPos.y, b.radius * 1.5 * groundPos.scale, b.radius * 0.45 * groundPos.scale, 0, 0, Math.PI*2);
     ctx.fill();
   }
 
   // Ball
+  const r = Math.max(2, b.radius * pos.scale);
   ctx.fillStyle = '#CCEE44';
-  ctx.beginPath();
-  ctx.arc(bx, by, radius, 0, Math.PI*2);
-  ctx.fill();
-
-  // Seam
-  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.arc(bx, by, radius * 0.7, 0.5, Math.PI - 0.5);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.arc(bx, by, radius * 0.7, Math.PI + 0.5, -0.5);
-  ctx.stroke();
+  ctx.beginPath(); ctx.arc(pos.x, pos.y, r, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(pos.x, pos.y, r * 0.7, 0.5, Math.PI-0.5); ctx.stroke();
+  ctx.beginPath(); ctx.arc(pos.x, pos.y, r * 0.7, Math.PI+0.5, -0.5); ctx.stroke();
 }
 
 // ===== DRAWING: HUD =====
@@ -1069,7 +1099,7 @@ function drawMatchOver(ctx) {
     ctx.fillStyle = COLORS.cream;
     ctx.font = '9px "Press Start 2P"';
     ctx.fillText('POLO BEAR WINS!', W/2, 128);
-    drawBear(ctx, 240, 280, true, 0, 120, 0, Math.sin(Date.now()*0.004)*4);
+    drawBear(ctx, 240, 300, true, 0, 120, 0, Math.sin(Date.now()*0.004)*4);
   } else {
     ctx.fillStyle = COLORS.red;
     ctx.font = '14px "Press Start 2P"';
@@ -1119,142 +1149,116 @@ function drawMatchOver(ctx) {
 function updateGame() {
   if (state !== 'playing') return;
 
-  // Player movement
+  // Player movement (court space)
   const moveDir = (keyLeft || touchLeft) ? -1 : (keyRight || touchRight) ? 1 : 0;
-  playerBear.x += moveDir * 4;
-  playerBear.x = Math.max(COURT_LEFT + 20, Math.min(COURT_RIGHT - 20, playerBear.x));
+  playerBear.cx += moveDir * 0.015;
+  playerBear.cx = Math.max(0.05, Math.min(0.95, playerBear.cx));
 
-  // CPU AI
-  const targetX = ball.x + cpuLag;
-  const dx = targetX - cpuBear.x;
-  // 12% miss rate: occasionally overshoot/undershoot
-  if (Math.random() < 0.002) cpuLag = (Math.random() - 0.5) * 60;
-  const move = Math.min(Math.abs(dx), cpuSpeed) * Math.sign(dx);
-  cpuBear.x += move;
-  cpuBear.x = Math.max(COURT_LEFT + 20, Math.min(COURT_RIGHT - 20, cpuBear.x));
+  // CPU AI (tracks ball.cx in court space, with lag for missed shots)
+  if (Math.random() < 0.002) cpuLag = (Math.random() - 0.5) * 0.28;
+  const targetCX = ball.cx + cpuLag;
+  const dcx = targetCX - cpuBear.cx;
+  cpuBear.cx += Math.min(Math.abs(dcx), cpuSpeed) * Math.sign(dcx);
+  cpuBear.cx = Math.max(0.05, Math.min(0.95, cpuBear.cx));
 
   // Bear bounce animation
-  playerBear.bounceT += 0.065;
-  playerBear.bounce = Math.sin(playerBear.bounceT) * 2;
-  cpuBear.bounceT += 0.065;
-  cpuBear.bounce = Math.sin(cpuBear.bounceT) * 2;
+  playerBear.bounceT += 0.065; playerBear.bounce = Math.sin(playerBear.bounceT) * 2;
+  cpuBear.bounceT += 0.065;    cpuBear.bounce    = Math.sin(cpuBear.bounceT) * 2;
 
-  // Swing cooldown
   if (swingCooldown > 0) swingCooldown--;
   if (playerBear.swing > 0) playerBear.swing--;
-  if (cpuBear.swing > 0) cpuBear.swing--;
+  if (cpuBear.swing > 0)    cpuBear.swing--;
   if (playerBear.celebrate > 0) playerBear.celebrate--;
-  if (cpuBear.celebrate > 0) cpuBear.celebrate--;
+  if (cpuBear.celebrate > 0)    cpuBear.celebrate--;
   if (playerBear.lose > 0) playerBear.lose--;
-  if (cpuBear.lose > 0) cpuBear.lose--;
+  if (cpuBear.lose > 0)    cpuBear.lose--;
 
   if (!inRally) return;
 
-  // Ball movement with slight parabolic arc gravity
-  ball.trail.push({x: ball.x, y: ball.y});
+  // Ball physics (court space + z-axis arc)
+  ball.trail.push({ cx: ball.cx, cy: ball.cy, z: ball.z });
   if (ball.trail.length > 4) ball.trail.shift();
 
   const spd = ball.speed;
-  ball.x += ball.vx * spd;
-  ball.y += ball.vy * spd;
-  // Slight gravity-like arc
-  ball.vy += 0.04;
+  ball.cx += ball.vcx * spd;
+  ball.cy += ball.vcy * spd;
+  ball.vz -= GRAVITY;
+  ball.z  += ball.vz;
 
-  // Spin effect after 5 hits
-  if (hitCount >= 5) {
-    ball.vx += (Math.random() - 0.5) * 0.04;
+  // Bounce on court surface
+  if (ball.z <= 0) {
+    ball.z = 0;
+    ball.vz = Math.abs(ball.vz) * 0.3;
+    if (ball.vz < 0.5) ball.vz = 0;
   }
 
-  // Wall bounces
-  if (ball.x - ball.radius < COURT_LEFT) {
-    ball.x = COURT_LEFT + ball.radius;
-    ball.vx = Math.abs(ball.vx);
-  }
-  if (ball.x + ball.radius > COURT_RIGHT) {
-    ball.x = COURT_RIGHT - ball.radius;
-    ball.vx = -Math.abs(ball.vx);
+  // Spin after 5 hits
+  if (hitCount >= 5) ball.vcx += (Math.random() - 0.5) * 0.002;
+
+  // Side wall bounces (court left/right)
+  if (ball.cx < 0) { ball.cx = 0; ball.vcx = Math.abs(ball.vcx); }
+  if (ball.cx > 1) { ball.cx = 1; ball.vcx = -Math.abs(ball.vcx); }
+
+  // Net collision: ONLY triggers when ball.z < net height at midcourt
+  // This is the FIX — old code had no z-axis so net blocked all crossing shots
+  if (ball.cy > NET_CY - 0.04 && ball.cy < NET_CY + 0.04 && ball.z < NET_HEIGHT_Z) {
+    ball.vcy = -ball.vcy * 0.3; // bounce back weakly
+    ball.vcx *= 0.5;
+    ball.vz = 0.5; ball.z = 0;
+    netWaveTimer = 0; // trigger wave anim
   }
 
-  // Net collision check (ball must clear net height)
-  const netHeight = 14;
-  const netTop = NET_Y - netHeight;
-  if (Math.abs(ball.y - NET_Y) < netHeight && ball.x > COURT_LEFT && ball.x < COURT_RIGHT) {
-    // Ball is near net height
-    if (ball.y > netTop && ball.y < NET_Y + 4) {
-      // Hit the net
-      ball.vy = -Math.abs(ball.vy) * 0.6;
-      ball.y = netTop - ball.radius;
-      netWave = Date.now() * 0.02;
-      // If ball falls back, it's a fault for whoever last hit it
-    }
-  }
-
-  // Player swing detection
-  if ((keySwing || touchRight || touchLeft) && swingCooldown === 0) {
-    const pdx = ball.x - playerBear.x;
-    const pdy = ball.y - (PLAYER_Y - 10);
-    const dist = Math.sqrt(pdx*pdx + pdy*pdy);
-    if (dist < 45 && ball.vy > 0) {
+  // Player swing detection (ball must be heading toward player, vcy<0)
+  if ((keySwing || touchLeft || touchRight) && swingCooldown === 0) {
+    const pdcx = Math.abs(ball.cx - playerBear.cx);
+    const pdcy = Math.abs(ball.cy - PLAYER_CY);
+    if (pdcx < 0.13 && pdcy < 0.13 && ball.z < 22 && ball.vcy < 0) {
       hitBall('player');
     }
   }
 
-  // CPU auto-hit
-  const cdx = ball.x - cpuBear.x;
-  const cdy = ball.y - (CPU_Y + 10);
-  const cdist = Math.sqrt(cdx*cdx + cdy*cdy);
-  if (cdist < 45 && ball.vy < 0 && cpuBear.swing === 0) {
-    // 12% miss chance
-    if (Math.random() < 0.12) {
-      // CPU misses — ball continues through
-    } else {
-      hitBall('cpu');
-    }
+  // CPU auto-hit (ball must be heading toward CPU, vcy>0)
+  const cdcx = Math.abs(ball.cx - cpuBear.cx);
+  const cdcy = Math.abs(ball.cy - CPU_CY);
+  if (cdcx < 0.13 && cdcy < 0.13 && ball.z < 22 && ball.vcy > 0 && cpuBear.swing === 0) {
+    if (Math.random() < 0.12) { /* CPU misses */ }
+    else { hitBall('cpu'); }
   }
 
-  // Score: ball past player (bottom)
-  if (ball.y > COURT_BOTTOM + 10) {
-    cpuBear.celebrate = 60;
-    playerBear.lose = 60;
-    inRally = false;
-    scorePoint('cpu');
-    return;
+  // Score: ball past player baseline (cy < 0)
+  if (ball.cy < -0.06) {
+    cpuBear.celebrate = 60; playerBear.lose = 60;
+    inRally = false; scorePoint('cpu'); return;
   }
-
-  // Score: ball past CPU (top)
-  if (ball.y < COURT_TOP + 80) {
-    playerBear.celebrate = 60;
-    cpuBear.lose = 60;
-    inRally = false;
-    scorePoint('player');
-    return;
+  // Score: ball past CPU baseline (cy > 1)
+  if (ball.cy > 1.06) {
+    playerBear.celebrate = 60; cpuBear.lose = 60;
+    inRally = false; scorePoint('player'); return;
   }
 }
 
 function hitBall(hitter) {
   playThwack();
   hitCount++;
-  // Speed increase per hit
   ball.speed = 1 + (currentSet * 0.08) + Math.min(hitCount * 0.04, 0.8);
 
   if (hitter === 'player') {
     swingCooldown = 18;
     playerBear.swing = 18;
-    const angle = (ball.x - playerBear.x) * 0.035;
-    ball.vx = angle + (Math.random() - 0.5) * 0.5;
-    ball.vy = -(5 + Math.random() * 2);
-    ball.y = PLAYER_Y - 50;
+    const ax = (ball.cx - playerBear.cx) * 0.075 + (Math.random()-0.5)*0.018;
+    ball.vcx = Math.max(-0.04, Math.min(0.04, ax));
+    ball.vcy = 0.028 + Math.random() * 0.009; // toward CPU (positive)
+    ball.vz = 5 + Math.random() * 0.8;
+    ball.z = 2; ball.cy = PLAYER_CY + 0.06;
   } else {
     cpuBear.swing = 18;
-    const angle = (ball.x - cpuBear.x) * 0.035;
-    ball.vx = angle + (Math.random() - 0.5) * 0.5;
-    ball.vy = (5 + Math.random() * 2);
-    ball.y = CPU_Y + 50;
+    const ax = (ball.cx - cpuBear.cx) * 0.075 + (Math.random()-0.5)*0.018;
+    ball.vcx = Math.max(-0.04, Math.min(0.04, ax));
+    ball.vcy = -(0.028 + Math.random() * 0.009); // toward player (negative)
+    ball.vz = 5 + Math.random() * 0.8;
+    ball.z = 2; ball.cy = CPU_CY - 0.06;
   }
-
-  // Clamp vx
-  ball.vx = Math.max(-5, Math.min(5, ball.vx));
-  netWave = Date.now() * 0.02;
+  netWaveTimer += 1;
 }
 
 // ===== MAIN GAME LOOP =====
@@ -1314,22 +1318,23 @@ function gameLoop(timestamp) {
     // Draw court
     drawCourt(ctx);
 
-    // Draw bears
-    const pbounce = playerBear.bounce;
-    const cbounce = cpuBear.bounce;
-    // CPU bear (upside down perspective — flip vertically)
+    // Draw bears in perspective
+    const cpuPos    = courtToScreen(cpuBear.cx, CPU_CY, 0);
+    const playerPos = courtToScreen(playerBear.cx, PLAYER_CY, 0);
+
+    // CPU bear — smaller (far end) and flipped to face player
     ctx.save();
-    ctx.translate(cpuBear.x, cpuBear.y);
-    ctx.scale(1, -1); // flip for CPU (facing down)
-    ctx.translate(-cpuBear.x, -cpuBear.y);
-    drawBear(ctx, cpuBear.x, cpuBear.y, false, cpuBear.swing, cpuBear.celebrate, cpuBear.lose, cbounce);
+    ctx.translate(cpuPos.x, cpuPos.y);
+    ctx.scale(cpuPos.scale, -cpuPos.scale); // perspective scale + flip to face down
+    ctx.translate(-cpuPos.x, -cpuPos.y);
+    drawBear(ctx, cpuPos.x, cpuPos.y, false, cpuBear.swing, cpuBear.celebrate, cpuBear.lose, cpuBear.bounce);
     ctx.restore();
 
-    // Player bear
-    drawBear(ctx, playerBear.x, playerBear.y, true, playerBear.swing, playerBear.celebrate, playerBear.lose, pbounce);
+    // Ball (with z-axis arc, drawn between the two bears for correct depth)
+    drawBall(ctx, ball);
 
-    // Ball
-    drawBall(ctx, ball.x, ball.y, ball.radius, ball.trail);
+    // Player bear — full size (near end)
+    drawBear(ctx, playerPos.x, playerPos.y, true, playerBear.swing, playerBear.celebrate, playerBear.lose, playerBear.bounce);
 
     // Confetti
     drawConfetti(ctx);
