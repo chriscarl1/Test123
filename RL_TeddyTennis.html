@@ -1199,20 +1199,17 @@ function updateGame() {
   if (ball.cx < 0) { ball.cx = 0; ball.vcx = Math.abs(ball.vcx); }
   if (ball.cx > 1) { ball.cx = 1; ball.vcx = -Math.abs(ball.vcx); }
 
-  // Net collision: ONLY triggers when ball.z < net height at midcourt
-  // This is the FIX — old code had no z-axis so net blocked all crossing shots
-  if (ball.cy > NET_CY - 0.04 && ball.cy < NET_CY + 0.04 && ball.z < NET_HEIGHT_Z) {
-    ball.vcy = -ball.vcy * 0.3; // bounce back weakly
-    ball.vcx *= 0.5;
-    ball.vz = 0.5; ball.z = 0;
-    netWaveTimer = 0; // trigger wave anim
-  }
+  // NOTE: No net collision — ball always clears the net visually via z-axis arc.
+  // Net is visual decoration. Adding a collision here caused an infinite-loop bug
+  // where z dropped to 0 inside the net zone and refired every frame.
+  // Trigger net wave on any ball crossing near cy=0.5
+  if (Math.abs(ball.cy - NET_CY) < 0.06) netWaveTimer++;
 
-  // Player swing detection (ball must be heading toward player, vcy<0)
+  // Player swing detection — ball must be near player and heading toward them (vcy<0)
   if ((keySwing || touchLeft || touchRight) && swingCooldown === 0) {
     const pdcx = Math.abs(ball.cx - playerBear.cx);
     const pdcy = Math.abs(ball.cy - PLAYER_CY);
-    if (pdcx < 0.13 && pdcy < 0.13 && ball.z < 22 && ball.vcy < 0) {
+    if (pdcx < 0.16 && pdcy < 0.16 && ball.z < 26 && ball.vcy < 0) {
       hitBall('player');
     }
   }
@@ -1220,7 +1217,7 @@ function updateGame() {
   // CPU auto-hit (ball must be heading toward CPU, vcy>0)
   const cdcx = Math.abs(ball.cx - cpuBear.cx);
   const cdcy = Math.abs(ball.cy - CPU_CY);
-  if (cdcx < 0.13 && cdcy < 0.13 && ball.z < 22 && ball.vcy > 0 && cpuBear.swing === 0) {
+  if (cdcx < 0.16 && cdcy < 0.16 && ball.z < 26 && ball.vcy > 0 && cpuBear.swing === 0) {
     if (Math.random() < 0.12) { /* CPU misses */ }
     else { hitBall('cpu'); }
   }
